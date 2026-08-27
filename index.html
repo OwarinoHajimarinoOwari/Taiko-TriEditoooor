@@ -1921,7 +1921,7 @@ function handleKeyDown(e) {
         return; 
     } 
     if (!isPlaying && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) { e.preventDefault(); startArrowKeyScroll(e.key, e.key === 'ArrowLeft' ? -1 : 1); return; }
-    if (e.key === ' ') { e.preventDefault(); playMeasure(); } 
+    if (e.key === ' ') { e.preventDefault(); togglePlay(); } 
 }
 function handleKeyUp(e) { if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { if (arrowKeyTimers[e.key]) { clearTimeout(arrowKeyTimers[e.key].timer); arrowKeyTimers[e.key] = null; } } }
 previewContainer.addEventListener('keydown', handleKeyDown); previewContainer.addEventListener('keyup', handleKeyUp);
@@ -1961,7 +1961,7 @@ function handlePlayerInput(inputType, hitEffectType) {
         const note = regularArr[i]; if (note.type === '0' || note.judgeResult !== 'pending' || (note.type >= '5' && note.type <= '7') || note.type === 'BARLINE') continue; 
         const diff = note.time - elapsedTime; if (diff > JUDGE_BAD) break;
         const absDiff = Math.abs(diff); if (absDiff > JUDGE_BAD) continue; 
-        const noteType = (note.type === '1' || note.type === '3') ? 'don' : 'ka'; if (noteType !== inputType) continue; 
+        const noteType = (note.type === '1' || note.type === '3') ? 'don : 'ka'; if (noteType !== inputType) continue; 
         if (absDiff < minDiff) { minDiff = absDiff; targetNote = note; } 
     } 
     if (targetNote) { 
@@ -2145,7 +2145,7 @@ function handlePlayerInput(inputType, hitEffectType) {
                 document.getElementById('fixedBpmValueSetting').value = fixedBpmValue;
                 if (!isPlaying) updatePreview();
             }
-        }, { passive: false });
+        }, { passive: false, capture: true });
 
         window.toggleOriginalMode = function() {
             isOriginalMode = !isOriginalMode;
@@ -2178,7 +2178,7 @@ function handlePlayerInput(inputType, hitEffectType) {
                 toggleAutoPlay(); 
                 document.getElementById('autoPlaySetting').checked = isAutoPlay; 
             }
-        });</script>
+        }, true);</script>
     <script>function setupDropdown(buttonId, menuId) { const button = document.getElementById(buttonId); const menu = document.getElementById(menuId); button.addEventListener('click', (e) => { e.stopPropagation(); menu.style.display = menu.style.display === 'block' ? 'none' : 'block'; }); menu.addEventListener('click', (e) => { e.stopPropagation(); menu.style.display = menu.style.display === 'block' ? 'none' : 'block'; }); menu.addEventListener('click', (e) => { e.stopPropagation(); }); }
 setupDropdown('importDropdownButton', 'importDropdownMenu'); setupDropdown('exportDropdownButton', 'exportDropdownMenu');
 window.addEventListener('click', () => { document.getElementById('importDropdownMenu').style.display = 'none'; document.getElementById('exportDropdownMenu').style.display = 'none'; });
