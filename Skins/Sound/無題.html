@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sound List Generator</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-white flex flex-col items-center justify-center min-h-screen p-4">
+    <div class="bg-gray-800 p-6 rounded-xl max-w-md w-full shadow-2xl border border-gray-700 text-center">
+        <h1 class="text-xl font-bold mb-4">sound_list.json 作成ツール</h1>
+        <p class="text-sm text-gray-300 mb-6">
+            下のボタンを押して、端末内の<br>
+            <span class="text-yellow-400 font-mono font-bold">Skins > Sound</span> フォルダを選択してください。
+        </p>
+
+        <input type="file" id="folderInput" webkitdirectory directory class="hidden">
+        <button id="selectBtn" class="w-full py-3 bg-blue-600 hover:bg-blue-500 rounded-lg font-bold shadow-lg transition">
+            Sound フォルダを選択
+        </button>
+
+        <div id="resultBox" class="mt-6 text-left text-sm bg-gray-950 p-4 rounded-lg hidden font-mono border border-gray-800">
+            <p id="resTaiko" class="text-green-400"></p>
+            <p id="resCombo" class="text-blue-400 mt-1"></p>
+            <p class="text-xs text-gray-400 mt-3 border-t border-gray-800 pt-2">
+                ※ ダウンロードされた <span class="text-white font-bold">sound_list.json</span> を、<span class="text-yellow-400 font-bold">Skins/Sound/</span> フォルダの中に移動してください。
+            </p>
+        </div>
+    </div>
+
+    <script>
+        const SUPPORTED_EXTS = [
+            '.mp3','.wav','.ogg','.flac','.m4a','.aac','.mp4','.webm','.opus','.wma',
+            '.amr','.aiff','.au','.mid','.midi','.rmi','.mka','.ac3','.dts','.vqf',
+            '.ape','.alac','.wv','.spx','.mogg','.tak','.tta','.ra','.rm','.rv',
+            '.mp1','.mp2','.mpc','.dsf','.dff','.oga','.mov','.avi','.mkv','.flv',
+            '.wmv','.asf','.m2ts','.ts','.3gp','.3g2','.mxf'
+        ];
+
+        document.getElementById('selectBtn').onclick = () => {
+            document.getElementById('folderInput').click();
+        };
+
+        document.getElementById('folderInput').onchange = (e) => {
+            const files = Array.from(e.target.files);
+            if (!files.length) return;
+
+            const result = {
+                taiko: {},
+                combo: []
+            };
+
+            for (const file of files) {
+                // 相対パスの正規化 (例: Sound/Taiko/dong.wav or Sound/Combo/1P/100.ogg)
+                const pathParts = file.webkitRelativePath.split('/');
+                const fileName = pathParts[pathParts.length - 1];
+                const ext = '.' + fileName.split('.').pop().toLowerCase();
+
+                if (!SUPPORTED_EXTS.includes(ext)) continue;
+
+                const nameWithoutExt = fileName.substring(0, fileName.lastIndexOf('.'));
+
+                // Taiko フォルダ内の音声
+                if (pathParts.some(p => p.toLowerCase() === 'taiko')) {
+                    const lowerName = nameWithoutExt.toLowerCase();
+                    if (lowerName === 'don' || lowerName === 'dong') result.taiko.don = fileName;
+                    if (lowerName === 'ka') result.taiko.ka = fileName;
+                    if (lowerName === 'balloon') result.taiko.balloon = fileName;
+                }
+
+                // Combo/1P フォルダ内の音声 (整数判定)
+                if (pathParts.some(p => p.toLowerCase() === 'combo') && /^\d+$/.test(nameWithoutExt)) {
+                    result.combo.push(fileName);
+                }
+            }
+
+            // JSONファイルの作成とダウンロード
+            const jsonStr = JSON.stringify(result, null, 4);
+            const blob = new Blob([jsonStr], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'sound_list.json';
+            a.click();
+            URL.revokeObjectURL(url);
+
+            // 結果表示
+            document.getElementById('resultBox').classList.remove('hidden');
+            document.getElementById('resTaiko').textContent = `検出された打音: ${Object.keys(result.taiko).join(', ') || 'なし'}`;
+            document.getElementById('resCombo').textContent = `検出されたコンボボイス数: ${result.combo.length} 個`;
+        };
+    </script>
+</body>
+</html>
