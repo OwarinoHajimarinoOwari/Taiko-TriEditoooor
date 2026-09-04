@@ -157,6 +157,7 @@ BALLOON:10
         <div id="roll-count-display"></div>
         <div id="combo-display"></div>
         <div id="measure-display" title="クリックして数値を直接入力しEnterで移動"></div>
+        <div id="previewFpsDisplay" style="position: absolute; top: 4px; left: 4px; font-family: monospace; font-size: 10px; color: #00FF00; z-index: 45; pointer-events: none;"></div>
     </div>
 
     <canvas id="fhdCanvas" tabindex="0" width="1920" height="1080" style="display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; object-fit: contain; z-index: 9999; background: #000; outline: none;"></canvas>
@@ -301,7 +302,9 @@ BALLOON:10
             </div>
 
             <div class="mt-8 flex justify-between items-center">
-                <button id="showHelpButton" class="text-sm text-blue-600 hover:underline font-semibold">操作方法・仕様を確認</button>
+                <div class="flex space-x-4 items-center">
+                    <button id="showHelpButton" class="text-sm text-blue-600 hover:underline font-semibold">操作方法・仕様を確認</button>
+                </div>
                 <div class="flex space-x-3">
                     <button id="saveSettingsButton" class="px-5 py-2 bg-blue-500 hover:bg-blue-600 text-white font-semibold rounded-lg shadow">保存して閉じる</button>
                     <button id="closeSettingsButton" class="px-5 py-2 bg-gray-300 hover:bg-gray-400 text-black font-semibold rounded-lg shadow">キャンセル</button>
@@ -367,7 +370,8 @@ BALLOON:10
     </div>
 
     <!-- 1. WebGL・基本定数・状態管理（土台） -->
-    <script>// --- WebGL用パイプライン実装 ---
+    <script>
+        // --- WebGL用パイプライン実装 ---
         function initWebGL(gl) {
             if (!gl) return null;
             const vsSource = `
@@ -438,8 +442,292 @@ BALLOON:10
             gl.enableVertexAttribArray(glData.texCoordLocation);
             gl.vertexAttribPointer(glData.texCoordLocation, 2, gl.FLOAT, false, 0, 0);
             gl.bindTexture(gl.TEXTURE_2D, glData.texture);
-            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas2D);
+            
+            if (glData.texWidth !== canvas2D.width || glData.texHeight !== canvas2D.height) {
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas2D);
+                glData.texWidth = canvas2D.width;
+                glData.texHeight = canvas2D.height;
+            } else {
+                gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, canvas2D);
+            }
+            
             gl.drawArrays(gl.TRIANGLES, 0, 6);
+        }
+
+        // --- WebGL スプライトバッチ & テクスチャアトラス実装 ---
+        const NOTE_COLORS_RGBA = {
+            '1': [0.957, 0.263, 0.212, 1.0], // #F44336
+            '2': [0.129, 0.588, 0.953, 1.0], // #2196F3
+            '3': [0.957, 0.263, 0.212, 1.0],
+            '4': [0.129, 0.588, 0.953, 1.0],
+            '5': [1.0, 0.757, 0.027, 1.0],   // #FFC107
+            '6': [1.0, 0.757, 0.027, 1.0],
+            '7': [0.976, 0.475, 0.008, 1.0]   // #f97902
+        };
+
+        function initSpriteBatchShader(gl) {
+            if (!gl) return null;
+            const vsSource = `
+                attribute vec2 a_position;
+                attribute vec2 a_texCoord;
+                attribute vec4 a_color;
+                uniform vec2 u_resolution;
+                varying vec2 v_texCoord;
+                varying vec4 v_color;
+                void main() {
+                    vec2 zeroToOne = a_position / u_resolution;
+                    vec2 zeroToTwo = zeroToOne * 2.0;
+                    vec2 clipSpace = zeroToTwo - 1.0;
+                    gl_Position = vec4(clipSpace * vec2(1, -1), 0.0, 1.0);
+                    v_texCoord = a_texCoord;
+                    v_color = a_color;
+                }
+            `;
+            const fsSource = `
+                precision mediump float;
+                varying vec2 v_texCoord;
+                varying vec4 v_color;
+                uniform sampler2D u_image;
+                void main() {
+                    vec4 texColor = texture2D(u_image, v_texCoord);
+                    vec4 col = texColor * v_color;
+                    gl_FragColor = vec4(col.rgb * col.a, col.a);
+                }
+            `;
+            function compileShader(gl, type, source) {
+                const shader = gl.createShader(type);
+                gl.shaderSource(shader, source);
+                gl.compileShader(shader);
+                return shader;
+            }
+            const vs = compileShader(gl, gl.VERTEX_SHADER, vsSource);
+            const fs = compileShader(gl, gl.FRAGMENT_SHADER, fsSource);
+            const program = gl.createProgram();
+            gl.attachShader(program, vs); gl.attachShader(program, fs); gl.linkProgram(program);
+
+            return {
+                program,
+                positionLoc: gl.getAttribLocation(program, "a_position"),
+                texCoordLoc: gl.getAttribLocation(program, "a_texCoord"),
+                colorLoc: gl.getAttribLocation(program, "a_color"),
+                uResolutionLoc: gl.getUniformLocation(program, "u_resolution"),
+                uImageLoc: gl.getUniformLocation(program, "u_image")
+            };
+        }
+
+        class WebGLSpriteBatch {
+            constructor(gl, maxQuads = 12000) {
+                this.gl = gl;
+                this.maxQuads = maxQuads;
+                this.vertexCount = 0;
+                this.shaderData = initSpriteBatchShader(gl);
+                this.vertices = new Float32Array(maxQuads * 6 * 8); // x, y, u, v, r, g, b, a
+                this.buffer = gl.createBuffer();
+
+                gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
+                gl.bufferData(gl.ARRAY_BUFFER, this.vertices.byteLength, gl.DYNAMIC_DRAW);
+            }
+
+            begin(width, height) {
+                this.vertexCount = 0;
+                this.width = width;
+                this.height = height;
+            }
+
+            addQuadVertices(x0, y0, x1, y1, x2, y2, x3, y3, u0, v0, u1, v1, r = 1, g = 1, b = 1, a = 1) {
+                if (this.vertexCount + 6 > this.maxQuads * 6) return;
+                const i = this.vertexCount * 8;
+                const v = this.vertices;
+
+                v[i]    = x0; v[i+1]  = y0; v[i+2]  = u0; v[i+3]  = v0; v[i+4]  = r; v[i+5]  = g; v[i+6]  = b; v[i+7]  = a;
+                v[i+8]  = x1; v[i+9]  = y1; v[i+10] = u1; v[i+11] = v0; v[i+12] = r; v[i+13] = g; v[i+14] = b; v[i+15] = a;
+                v[i+16] = x3; v[i+17] = y3; v[i+18] = u0; v[i+19] = v1; v[i+20] = r; v[i+21] = g; v[i+22] = b; v[i+23] = a;
+
+                v[i+24] = x1; v[i+25] = y1; v[i+26] = u1; v[i+27] = v0; v[i+28] = r; v[i+29] = g; v[i+30] = b; v[i+31] = a;
+                v[i+32] = x2; v[i+33] = y2; v[i+34] = u1; v[i+35] = v1; v[i+36] = r; v[i+37] = g; v[i+38] = b; v[i+39] = a;
+                v[i+40] = x3; v[i+41] = y3; v[i+42] = u0; v[i+43] = v1; v[i+44] = r; v[i+45] = g; v[i+46] = b; v[i+47] = a;
+
+                this.vertexCount += 6;
+            }
+
+            addQuad(x, y, w, h, u0, v0, u1, v1, r = 1, g = 1, b = 1, a = 1) {
+                this.addQuadVertices(x, y, x + w, y, x + w, y + h, x, y + h, u0, v0, u1, v1, r, g, b, a);
+            }
+
+            addRotatedQuad(cx, cy, w, h, angle, u0, v0, u1, v1, ox = 0.5, oy = 0.5, r = 1, g = 1, b = 1, a = 1) {
+                const cos = Math.cos(angle), sin = Math.sin(angle);
+                const x0 = -ox * w, y0 = -oy * h;
+                const x1 = (1 - ox) * w, y1 = (1 - oy) * h;
+
+                const p0x = cx + (x0 * cos - y0 * sin), p0y = cy + (x0 * sin + y0 * cos);
+                const p1x = cx + (x1 * cos - y0 * sin), p1y = cy + (x1 * sin + y0 * cos);
+                const p2x = cx + (x1 * cos - y1 * sin), p2y = cy + (x1 * sin + y1 * cos);
+                const p3x = cx + (x0 * cos - y1 * sin), p3y = cy + (x0 * sin + y1 * cos);
+
+                this.addQuadVertices(p0x, p0y, p1x, p1y, p2x, p2y, p3x, p3y, u0, v0, u1, v1, r, g, b, a);
+            }
+
+            addThickLine(x1, y1, x2, y2, thickness, u0, v0, u1, v1, r = 1, g = 1, b = 1, a = 1) {
+                const dx = x2 - x1, dy = y2 - y1;
+                const len = Math.hypot(dx, dy);
+                if (len < 0.001) return;
+                const halfThick = thickness / 2;
+                const nx = (-dy / len) * halfThick, ny = (dx / len) * halfThick;
+
+                this.addQuadVertices(x1 + nx, y1 + ny, x2 + nx, y2 + ny, x2 - nx, y2 - ny, x1 - nx, y1 - ny, u0, v0, u1, v1, r, g, b, a);
+            }
+
+            end() {
+                if (this.vertexCount === 0) return;
+                const gl = this.gl;
+                const sd = this.shaderData;
+
+                gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+                gl.clearColor(0, 0, 0, 0);
+                gl.clear(gl.COLOR_BUFFER_BIT);
+
+                gl.enable(gl.BLEND);
+                // プレマルチプライドアルファ用の標準ブレンド
+                gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+
+                gl.useProgram(sd.program);
+
+                gl.activeTexture(gl.TEXTURE0);
+                gl.bindTexture(gl.TEXTURE_2D, atlasTexture);
+                if (sd.uImageLoc) gl.uniform1i(sd.uImageLoc, 0);
+
+                gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
+                gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.vertices.subarray(0, this.vertexCount * 8));
+
+                gl.enableVertexAttribArray(sd.positionLoc);
+                gl.vertexAttribPointer(sd.positionLoc, 2, gl.FLOAT, false, 32, 0);
+
+                gl.enableVertexAttribArray(sd.texCoordLoc);
+                gl.vertexAttribPointer(sd.texCoordLoc, 2, gl.FLOAT, false, 32, 8);
+
+                gl.enableVertexAttribArray(sd.colorLoc);
+                gl.vertexAttribPointer(sd.colorLoc, 4, gl.FLOAT, false, 32, 16);
+
+                gl.uniform2f(sd.uResolutionLoc, this.width, this.height);
+
+                gl.drawArrays(gl.TRIANGLES, 0, this.vertexCount);
+            }
+        }
+
+        let atlasTexture = null;
+        let atlasCanvas = null;
+        const atlasSprites = {};
+        let lastAtlasDpr = 0;
+
+        function initTextureAtlas(gl, dpr) {
+            if (!gl) return;
+            lastAtlasDpr = dpr;
+
+            const atlasLogicalWidth = 512;
+            const atlasLogicalHeight = 256;
+
+            if (!atlasCanvas) atlasCanvas = document.createElement('canvas');
+            atlasCanvas.width = Math.ceil(atlasLogicalWidth * dpr);
+            atlasCanvas.height = Math.ceil(atlasLogicalHeight * dpr);
+
+            const actx = atlasCanvas.getContext('2d');
+            actx.clearRect(0, 0, atlasCanvas.width, atlasCanvas.height);
+            actx.save();
+            actx.scale(dpr, dpr);
+
+            let curX = 2, curY = 2, rowH = 0;
+
+            function packItem(name, w, h, drawFn) {
+                if (curX + w + 2 > atlasLogicalWidth) {
+                    curX = 2;
+                    curY += rowH + 2;
+                    rowH = 0;
+                }
+                const itemX = curX, itemY = curY;
+
+                actx.save();
+                actx.translate(itemX, itemY);
+                drawFn(actx);
+                actx.restore();
+
+                const u0 = (itemX * dpr) / atlasCanvas.width;
+                const v0 = (itemY * dpr) / atlasCanvas.height;
+                const u1 = ((itemX + w) * dpr) / atlasCanvas.width;
+                const v1 = ((itemY + h) * dpr) / atlasCanvas.height;
+
+                atlasSprites[name] = { u0, v0, u1, v1, w, h };
+                curX += w + 2;
+                if (h > rowH) rowH = h;
+            }
+
+            // 白ピクセル（単色線・塗り用）
+            packItem('white', 8, 8, (ctx) => {
+                ctx.fillStyle = '#FFFFFF';
+                ctx.fillRect(0, 0, 8, 8);
+            });
+
+            // ノーツ 1〜7
+            for (let type of ['1', '2', '3', '4', '5', '6', '7']) {
+                const size = NOTE_SIZE[type];
+                let whiteWidth, blackWidth;
+                if (type === '3' || type === '4' || type === '6') { whiteWidth = 6; blackWidth = 1.5; } else { whiteWidth = 4; blackWidth = 1; }
+                const totalRadius = size + whiteWidth + blackWidth + 2;
+                const cSize = totalRadius * 2;
+                const center = totalRadius;
+                const color = NOTE_COLORS[type];
+
+                // 始点・通常ノーツ（白枠＋黒枠ありの二重円）
+                packItem('note_' + type, cSize, cSize, (ctx) => {
+                    ctx.beginPath(); ctx.arc(center, center, size, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill(); 
+                    ctx.lineWidth = whiteWidth; ctx.strokeStyle = '#FFFFFF'; ctx.stroke(); 
+                    ctx.beginPath(); ctx.arc(center, center, size + (whiteWidth / 2) + (blackWidth / 2), 0, Math.PI * 2); ctx.lineWidth = blackWidth; ctx.strokeStyle = '#000000'; ctx.stroke();
+                });
+                atlasSprites['note_' + type].center = center;
+
+                // 連打の終点（枠線なし・単色塗りつぶしの丸）
+                if (type === '5' || type === '6') {
+                    packItem('note_' + type + '_end', cSize, cSize, (ctx) => {
+                        ctx.beginPath(); ctx.arc(center, center, size, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill();
+                    });
+                    atlasSprites['note_' + type + '_end'].center = center;
+                }
+            }
+
+            // 風船の尻尾
+            packItem('tail', 100, 60, (ctx) => {
+                ctx.translate(20, 25);
+                ctx.fillStyle = NOTE_COLORS['7']; ctx.strokeStyle = '#1a1a1a'; ctx.lineWidth = 2; ctx.lineJoin = 'round';
+                ctx.beginPath(); ctx.moveTo(22, -4); ctx.bezierCurveTo(28, -2, 35, -15, 48, -15); ctx.arc(48, 0, 15, -Math.PI/2, Math.PI/2); ctx.bezierCurveTo(35, 15, 28, 2, 22, 4); ctx.closePath(); ctx.fill(); ctx.stroke();
+                ctx.beginPath(); ctx.rect(15, -5.5, 7, 11); ctx.fill(); ctx.stroke();
+            });
+            atlasSprites['tail'].offsetX = 20;
+            atlasSprites['tail'].offsetY = 25;
+
+            // 風船打数用の数字フォント (0〜9)
+            for (let d = 0; d <= 9; d++) {
+                const dStr = d.toString();
+                packItem('digit_' + d, 14, 18, (ctx) => {
+                    ctx.font = "bold 14px 'Inter', sans-serif";
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.lineWidth = 3;
+                    ctx.strokeStyle = '#000000';
+                    ctx.strokeText(dStr, 7, 9);
+                    ctx.fillStyle = '#FFFFFF';
+                    ctx.fillText(dStr, 7, 9);
+                });
+            }
+
+            actx.restore();
+
+            // GPUテクスチャへ転送（サイズ/DPR変更時のみ）
+            if (!atlasTexture) atlasTexture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, atlasTexture);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, atlasCanvas);
         }
 
         const preRenderedFHD = {};
@@ -460,7 +748,11 @@ BALLOON:10
 
         function safeDrawImage(ctx, imgKey, ...args) { 
             const canvas = getFhdImageCanvas(imgKey);
-            if (canvas) { ctx.drawImage(canvas, ...args); return true; } 
+            if (canvas) { 
+                if (args.length === 2) ctx.drawImage(canvas, args[0], args[1]);
+                else ctx.drawImage(canvas, ...args);
+                return true; 
+            } 
             return false; 
         }</script>
     <script>let isOriginalMode = false;
@@ -543,48 +835,6 @@ BALLOON:10
             if (playerKeys.donR) playerKeys.donR.forEach(k => fastKeyMap[k.toUpperCase()] = { type: 'don', effect: 'don-right' });
             if (playerKeys.kaL) playerKeys.kaL.forEach(k => fastKeyMap[k.toUpperCase()] = { type: 'ka', effect: 'ka-left' });
             if (playerKeys.kaR) playerKeys.kaR.forEach(k => fastKeyMap[k.toUpperCase()] = { type: 'ka', effect: 'ka-right' });
-        }
-        
-        const preRenderedNotes = {};
-        let isPreRendered = false;
-
-        function initPreRenderedNotes() {
-            const dpr = window.devicePixelRatio || 1;
-            for (let type of ['1', '2', '3', '4', '5', '6', '7']) {
-                const canvas = document.createElement('canvas');
-                const pctx = canvas.getContext('2d');
-                const size = NOTE_SIZE[type];
-                let whiteWidth, blackWidth;
-                if (type === '3' || type === '4' || type === '6') { whiteWidth = 6; blackWidth = 1.5; } else { whiteWidth = 4; blackWidth = 1; }
-                const totalRadius = size + whiteWidth + blackWidth + 2;
-                const cSize = totalRadius * 2;
-                canvas.width = cSize * dpr;
-                canvas.height = cSize * dpr;
-                pctx.scale(dpr, dpr);
-                const center = totalRadius;
-
-                const color = NOTE_COLORS[type];
-
-                pctx.beginPath(); pctx.arc(center, center, size, 0, Math.PI * 2); pctx.fillStyle = color; pctx.fill(); 
-                
-                pctx.lineWidth = whiteWidth; pctx.strokeStyle = '#FFFFFF'; pctx.stroke(); 
-                pctx.beginPath(); pctx.arc(center, center, size + (whiteWidth / 2) + (blackWidth / 2), 0, Math.PI * 2); pctx.lineWidth = blackWidth; pctx.strokeStyle = '#000000'; pctx.stroke();
-                
-                preRenderedNotes[type] = { canvas, center, totalRadius };
-            }
-            
-            const tcanvas = document.createElement('canvas');
-            const tctx = tcanvas.getContext('2d');
-            tcanvas.width = 100 * dpr;
-            tcanvas.height = 60 * dpr;
-            tctx.scale(dpr, dpr);
-            tctx.translate(20, 25);
-            tctx.fillStyle = NOTE_COLORS['7']; tctx.strokeStyle = '#1a1a1a'; tctx.lineWidth = 2; tctx.lineJoin = 'round';
-            tctx.beginPath(); tctx.moveTo(22, -4); tctx.bezierCurveTo(28, -2, 35, -15, 48, -15); tctx.arc(48, 0, 15, -Math.PI/2, Math.PI/2); tctx.bezierCurveTo(35, 15, 28, 2, 22, 4); tctx.closePath(); tctx.fill(); tctx.stroke();
-            tctx.beginPath(); tctx.rect(15, -5.5, 7, 11); tctx.fill(); tctx.stroke();
-            preRenderedNotes['tail'] = { canvas: tcanvas, offsetX: 20, offsetY: 25 };
-
-            isPreRendered = true;
         }
         </script>
 
@@ -859,7 +1109,7 @@ function calcNoteVisibleTimeRange(chart, note, canvasWidth, margin) {
     let pps_dist = Math.sqrt(ppsX_dist * ppsX_dist + ppsY_dist * ppsY_dist);
 
     if (pps_dist !== 0) {
-        let h = previewCanvas2D.height || 1080;
+        let h = 1080;
         let visibleDistRange = (Math.max(canvasWidth, h) + margin * 2) / pps_dist;
         let timePadding = visibleDistRange * 1.5; 
         timePadding = Math.max(5.0, Math.min(60.0, timePadding)) + 15.0; 
@@ -1079,20 +1329,22 @@ function rebuildRenderBins(chart, canvasWidth) {
 }</script>
     <script>function resizeCanvas() { 
     const dpr = window.devicePixelRatio || 1; 
-    canvas.width = canvas.clientWidth * dpr; 
-    canvas.height = canvas.clientHeight * dpr; 
-    previewCanvas2D.width = canvas.width;
-    previewCanvas2D.height = canvas.height;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); 
-    isPreRendered = false; 
+    const targetW = canvas.clientWidth * dpr;
+    const targetH = canvas.clientHeight * dpr;
+
+    if (canvas.width !== targetW || canvas.height !== targetH || lastAtlasDpr !== dpr) {
+        canvas.width = targetW; 
+        canvas.height = targetH; 
+        initTextureAtlas(glPreview, dpr);
+    }
 }
 
-function drawWaveform(elapsedTime) {
+function drawWaveformGL(elapsedTime, spriteBatch, canvasWidth, canvasHeight) {
     if (!isWaveformEnabled || !musicAudioBuffer) return;
     const data = musicAudioBuffer.getChannelData(0); const sampleRate = musicAudioBuffer.sampleRate;
-    const canvasWidth = canvas.clientWidth; const centerY = previewCanvas2D.height / window.devicePixelRatio / 2;
+    const centerY = canvasHeight / 2;
     const ppsX = BASE_SCROLL_FACTOR * fixedBpmValue * scrollMultiplier;
-    ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)'; ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
+    
     const offset = allCourses.globalConfig.OFFSET || 0; const targetTime = coolDownTime + Math.max(0, offset);
     const timeAtLeft = elapsedTime + (0 - HIT_POSITION_X) / ppsX; const timeAtRight = elapsedTime + (canvasWidth - HIT_POSITION_X) / ppsX;
     const audioTimeStart = (timeAtLeft - targetTime) * playbackSpeed; const audioTimeEnd = (timeAtRight - targetTime) * playbackSpeed;
@@ -1108,15 +1360,18 @@ function drawWaveform(elapsedTime) {
             rms = count > 0 ? Math.sqrt(sum / count) : 0;
         }
         const timeAtX = currentAudioTime / playbackSpeed + targetTime; const x = (timeAtX - elapsedTime) * ppsX + HIT_POSITION_X;
-        const amp = rms * (previewCanvas2D.height / window.devicePixelRatio) * 1.5; 
-        topPath.push({x: x, y: centerY - amp}); bottomPath.unshift({x: x, y: centerY + amp});
+        const amp = rms * canvasHeight * 1.5; 
+        topPath.push({x: x|0, y: (centerY - amp)|0}); bottomPath.push({x: x|0, y: (centerY + amp)|0});
         currentAudioTime += windowAudioTime;
     }
-    if (topPath.length === 0) return;
-    ctx.beginPath(); ctx.moveTo(topPath[0].x, topPath[0].y);
-    for(let i=1; i<topPath.length; i++) ctx.lineTo(topPath[i].x, topPath[i].y);
-    for(let i=0; i<bottomPath.length; i++) ctx.lineTo(bottomPath[i].x, bottomPath[i].y);
-    ctx.closePath(); ctx.fill(); ctx.stroke();
+    const w = atlasSprites.white;
+    if (!w) return;
+    const wu = (w.u0 + w.u1) * 0.5, wv = (w.v0 + w.v1) * 0.5;
+    for (let i = 0; i < topPath.length - 1; i++) {
+        const p1 = topPath[i], p2 = topPath[i + 1];
+        const b1 = bottomPath[i], b2 = bottomPath[i + 1];
+        spriteBatch.addQuadVertices(p1.x, p1.y, p2.x, p2.y, b2.x, b2.y, b1.x, b1.y, wu, wv, wu, wv, 1, 1, 1, 0.15);
+    }
 }
 
 function applyCommandState(cmd) {
@@ -1251,7 +1506,7 @@ function playSE(type) {
     const source = audioContext.createBufferSource(); source.buffer = buffer; source.connect(seGainNode); source.start(0); activeSourcesByBuffer.set(buffer, source); 
 }</script>
 
-    <!-- 4. 描画メイン処理（updatePreview などを先に定義） -->
+    <!-- 4. 描画メイン処理（WebGLスプライト描画） -->
     <script>function drawFHDLoop(elapsedTime = currentElapsedTime) {
     fctx.clearRect(0, 0, FHD_WIDTH, FHD_HEIGHT); const chart = currentChart; if (!chart) { renderWebGL(glFhd, glFhdData, fhdCanvas2D); return; }
     const hitX = FHD_HIT_X + (HIT_POSITION_X - 175) * JPOS_SCALE; const hitY = FHD_HIT_Y; const distNow = getDistanceAtTime(chart, elapsedTime);
@@ -1282,10 +1537,10 @@ function playSE(type) {
     for (let i = bin.barlines.length - 1; i >= 0; i--) { const note = bin.barlines[i]; if (note === chart.barlineArr[chart.barlineArr.length - 1]) continue; const pos = getFhdPos(note); if (pos.hidden || pos.x < -200 || pos.x > FHD_WIDTH + 200) continue; let angle = Math.atan2(pos.ppsY, pos.ppsX); fctx.save(); fctx.translate(pos.x, pos.y); fctx.rotate(angle); const img = getFhdImageCanvas('barline'); if (img) { fctx.drawImage(img, -img.width/2, -img.height/2); } else { fctx.beginPath(); fctx.moveTo(0, -300); fctx.lineTo(0, 300); fctx.strokeStyle = 'white'; fctx.lineWidth = 2; fctx.stroke(); } fctx.restore(); }
     
     const typeToImgIdx = {'1':0, '2':1, '3':2, '4':3, '5':4, '6':7, '7':10}; 
-    const drawImg = (imgIdx, dx, dy, angle = 0) => { const canvas = getFhdImageCanvas('note_' + imgIdx); if (!canvas) return; fctx.save(); fctx.translate(dx, dy); fctx.rotate(angle); fctx.drawImage(canvas, -195/2, -195/2, 195, 195); fctx.restore(); };
+    const drawImg = (imgIdx, dx, dy, angle = 0) => { const canvas = getFhdImageCanvas('note_' + imgIdx); if (!canvas) return; fctx.save(); fctx.translate(dx, dy); fctx.rotate(angle); fctx.drawImage(canvas, -97, -97, 195, 195); fctx.restore(); };
     
     for (let i = bin.regular.length - 1; i >= 0; i--) { const note = bin.regular[i]; if (note.type === '0') continue; const pos = getFhdPos(note); if (pos.hidden) continue; let {x, y, endX, endY, ppsX, ppsY} = pos; if (note.type >= '1' && note.type <= '4' && (note.judgeResult === 'hit' || x < -200 || x > FHD_WIDTH + 200)) continue; if ((note.type === '5' || note.type === '6') && (x < -200 && endX < -200) || (x > FHD_WIDTH + 200 && endX > FHD_WIDTH + 200)) continue; if (note.type === '7') { if (note.judgeResult === 'hit' || note.judgeResult === 'miss' || x < -200 || x > FHD_WIDTH + 200) continue; if (note.judgeResult === 'pending' && elapsedTime <= note.endTime) { if ((ppsX > 0 && x <= hitX && endX > hitX) || (ppsX < 0 && x >= hitX && endX < hitX) || (ppsY > 0 && y <= hitY && endY > hitY) || (ppsY < 0 && y >= hitY && endY < hitY)) { x = hitX; y = ppsX !== 0 ? pos.y + (hitX - pos.x)*(ppsY/ppsX) : hitY; } } else if (note.judgeResult === 'pending') { x = endX; y = endY; } }
-        if (note.type >= '1' && note.type <= '4') { drawImg(typeToImgIdx[note.type], x, y); } else if (note.type === '5' || note.type === '6') { let sIdx = note.type === '5' ? 4 : 7; let mIdx = note.type === '5' ? 5 : 8; let eIdx = note.type === '5' ? 6 : 9; let angle = Math.atan2(endY - y, endX - x); const imgMid = getFhdImageCanvas('note_' + mIdx); if (imgMid) { let dist = Math.hypot(endX - x, endY - y); fctx.save(); fctx.translate(x, y); fctx.rotate(angle); fctx.drawImage(imgMid, 0, -195/2, dist, 195); fctx.restore(); } drawImg(sIdx, x, y, angle); drawImg(eIdx, endX, endY, angle); } else if (note.type === '7') { let angle = Math.atan2(ppsY, ppsX); const bImg = getFhdImageCanvas('note_10'); if (bImg) { fctx.save(); fctx.translate(x, y); fctx.rotate(angle); fctx.drawImage(bImg, -195/2, -195/2, 390, 195); fctx.restore(); } if (note.hits > 0 && note.judgeResult === 'pending') { const rem = Math.max(0, note.hits - note.currentHits); fctx.font = "bold 50px sans-serif"; fctx.textAlign = "center"; fctx.textBaseline = "middle"; fctx.lineWidth = 6; fctx.strokeStyle = "black"; fctx.strokeText(rem, x + 30, y - 50); fctx.fillStyle = "white"; fctx.fillText(rem, x + 30, y - 50); } }
+        if (note.type >= '1' && note.type <= '4') { drawImg(typeToImgIdx[note.type], x, y); } else if (note.type === '5' || note.type === '6') { let sIdx = note.type === '5' ? 4 : 7; let mIdx = note.type === '5' ? 5 : 8; let eIdx = note.type === '5' ? 6 : 9; let angle = Math.atan2(endY - y, endX - x); const imgMid = getFhdImageCanvas('note_' + mIdx); if (imgMid) { let dist = Math.hypot(endX - x, endY - y); fctx.save(); fctx.translate(x, y); fctx.rotate(angle); fctx.drawImage(imgMid, 0, -97, dist, 195); fctx.restore(); } drawImg(sIdx, x, y, angle); drawImg(eIdx, endX, endY, angle); } else if (note.type === '7') { let angle = Math.atan2(ppsY, ppsX); const bImg = getFhdImageCanvas('note_10'); if (bImg) { fctx.save(); fctx.translate(x, y); fctx.rotate(angle); fctx.drawImage(bImg, -97, -97, 390, 195); fctx.restore(); } if (note.hits > 0 && note.judgeResult === 'pending') { const rem = Math.max(0, note.hits - note.currentHits); fctx.font = "bold 50px sans-serif"; fctx.textAlign = "center"; fctx.textBaseline = "middle"; fctx.lineWidth = 6; fctx.strokeStyle = "black"; fctx.strokeText(rem, x + 30, y - 50); fctx.fillStyle = "white"; fctx.fillText(rem, x + 30, y - 50); } }
     }
     
     safeDrawImage(fctx, 'minitaiko_bg', 0, 0);
@@ -1333,8 +1588,206 @@ function playSE(type) {
     renderWebGL(glFhd, glFhdData, fhdCanvas2D);
 }
 
+function renderSpritePreview(elapsedTime) {
+    const canvasWidth = canvas.clientWidth;
+    const canvasHeight = canvas.clientHeight;
+    const baseCenterY = canvasHeight / 2;
+    const canvasMargin = 100;
+    let activeRollNote = null;
+
+    spriteBatch.begin(canvasWidth, canvasHeight);
+
+    // 波形描画
+    drawWaveformGL(elapsedTime, spriteBatch, canvasWidth, canvasHeight);
+
+    const chart = currentChart;
+    if (chart) {
+        let binConfig = chart._binConfig;
+        if (!chart.renderBins || !binConfig || binConfig.canvasWidth !== canvasWidth || binConfig.scrollMultiplier !== scrollMultiplier || binConfig.isFixedBpmEnabled !== isFixedBpmEnabled || binConfig.fixedBpmValue !== fixedBpmValue || binConfig.isWaveformEnabled !== isWaveformEnabled || binConfig.scrollYDirection !== scrollYDirection) {
+            rebuildRenderBins(chart, canvasWidth);
+        }
+
+        // 4倍解像度カリングバッファの初期化
+        initCullBuffer(canvasWidth, canvasMargin);
+        const cullOffsetPx = canvasMargin * 4; 
+        const cullLimit = cullBufferObj.size;
+        const drawn1 = cullBufferObj.drawn1, drawn2 = cullBufferObj.drawn2, drawn3 = cullBufferObj.drawn3, drawn4 = cullBufferObj.drawn4, drawnBar = cullBufferObj.drawnBar, drawnGrid = cullBufferObj.drawnGrid;
+
+        const distNow = getDistanceAtTime(chart, elapsedTime);
+        const binIndex = Math.floor(elapsedTime / BIN_SIZE);
+        const bin = chart.renderBins.get(binIndex) || { regular: [], barlines: [] };
+
+        const wSprite = atlasSprites.white;
+        let wu = 0, wv = 0;
+        if (wSprite) {
+            wu = (wSprite.u0 + wSprite.u1) * 0.5;
+            wv = (wSprite.v0 + wSprite.v1) * 0.5;
+        }
+
+        // 小節線描画（無題.htmlと完全一致: 幅2px, rgba(255, 255, 255, 0.5), レーン全高）
+        const barlines = bin.barlines;
+        for (let i = 0; i < barlines.length; i++) {
+            const note = barlines[i];
+            if (note === chart.barlineArr[chart.barlineArr.length - 1]) continue;
+            const pos = calcNotePos(chart, note, elapsedTime, HIT_POSITION_X, baseCenterY, distNow);
+            if (pos.hidden || (pos.ppsX === 0 && pos.ppsY === 0)) continue;
+            if (pos.x < -canvasMargin || pos.x > canvasWidth + canvasMargin || pos.y < -canvasMargin || pos.y > canvasHeight + canvasMargin) continue;
+
+            const px = ((pos.x * 4) | 0) + cullOffsetPx;
+            const py = (pos.y * 4) | 0;
+            if (px >= 0 && px < cullLimit) {
+                const packVal = (cullBufferObj.frameId << 16) | ((py + 10000) & 0xFFFF);
+                if (drawnBar[px] === packVal) continue;
+                drawnBar[px] = packVal;
+            }
+
+            const angle = Math.atan2(pos.ppsY, pos.ppsX);
+            const normalAngle = angle + Math.PI / 2;
+            const dx = Math.cos(normalAngle) * (canvasHeight / 2);
+            const dy = Math.sin(normalAngle) * (canvasHeight / 2);
+            if (wSprite) spriteBatch.addThickLine(pos.x - dx, pos.y - dy, pos.x + dx, pos.y + dy, 2, wu, wv, wu, wv, 1, 1, 1, 0.5);
+        }
+
+        // 音符グリッド線描画（無題.htmlと完全一致: 通常1px/不透明度0.15, ハイライト3px/#00BFFF, 上下40px）
+        const regular = bin.regular;
+        if (showGridLines && wSprite) {
+            let hlPos = null;
+            for (let i = 0; i < regular.length; i++) {
+                const note = regular[i];
+                const pos = calcNotePos(chart, note, elapsedTime, HIT_POSITION_X, baseCenterY, distNow);
+                if (pos.hidden || pos.x < -canvasMargin || pos.x > canvasWidth + canvasMargin) continue;
+
+                const px = ((pos.x * 4) | 0) + cullOffsetPx;
+                const py = (pos.y * 4) | 0;
+                if (px >= 0 && px < cullLimit) {
+                    const packVal = (cullBufferObj.frameId << 16) | ((py + 10000) & 0xFFFF);
+                    if (drawnGrid[px] === packVal) continue;
+                    drawnGrid[px] = packVal;
+                }
+
+                const isHl = (note.lineIndex === highlightNoteLine && note.colIndex === highlightNoteCol);
+                if (isHl) {
+                    hlPos = pos.x;
+                } else {
+                    spriteBatch.addThickLine(pos.x, baseCenterY - 40, pos.x, baseCenterY + 40, 1, wu, wv, wu, wv, 1, 1, 1, 0.15);
+                }
+            }
+            if (hlPos !== null) {
+                spriteBatch.addThickLine(hlPos, baseCenterY - 40, hlPos, baseCenterY + 40, 3, wu, wv, wu, wv, 0.0, 0.749, 1.0, 1.0);
+            }
+        }
+
+        // ノーツ描画
+        for (let i = regular.length - 1; i >= 0; i--) {
+            const note = regular[i];
+            if (note.type === '0') continue;
+            if (chartCoolDownUntil !== null && note.time < chartCoolDownUntil) {
+                if (!(note.type >= '5' && note.type <= '7' && note.endTime > elapsedTime)) continue;
+            }
+
+            const pos = calcNotePos(chart, note, elapsedTime, HIT_POSITION_X, baseCenterY, distNow);
+            if (pos.hidden) continue;
+            const x = pos.x, y = pos.y, endX = pos.endX, endY = pos.endY, ppsX = pos.ppsX, ppsY = pos.ppsY;
+
+            let skip = false;
+            if (note.type >= '1' && note.type <= '4') {
+                if (note.judgeResult === 'hit' || (x < -canvasMargin || x > canvasWidth + canvasMargin || y < -canvasMargin || y > canvasHeight + canvasMargin)) skip = true;
+                if (!skip) {
+                    const px = ((x * 4) | 0) + cullOffsetPx;
+                    const py = (y * 4) | 0;
+                    if (px >= 0 && px < cullLimit) {
+                        const packVal = (cullBufferObj.frameId << 16) | ((py + 10000) & 0xFFFF);
+                        if (note.type === '1') { if (drawn1[px] === packVal) skip = true; else drawn1[px] = packVal; }
+                        else if (note.type === '2') { if (drawn2[px] === packVal) skip = true; else drawn2[px] = packVal; }
+                        else if (note.type === '3') { if (drawn3[px] === packVal) skip = true; else drawn3[px] = packVal; }
+                        else if (note.type === '4') { if (drawn4[px] === packVal) skip = true; else drawn4[px] = packVal; }
+                    }
+                }
+            } else if (note.type === '5' || note.type === '6') {
+                if ((x < -canvasMargin && endX < -canvasMargin) || (x > canvasWidth + canvasMargin && endX > canvasWidth + canvasMargin) || (y < -canvasMargin && endY < -canvasMargin) || (y > canvasHeight + canvasMargin && endY > canvasHeight + canvasMargin)) skip = true;
+            } else if (note.type === '7') {
+                if (note.judgeResult === 'hit' || note.judgeResult === 'miss') skip = true;
+            }
+
+            if (skip) continue;
+
+            // 1〜4: 通常ノーツ
+            if (note.type >= '1' && note.type <= '4') {
+                const s = atlasSprites['note_' + note.type];
+                if (s) spriteBatch.addQuad(x - s.center, y - s.center, s.w, s.h, s.u0, s.v0, s.u1, s.v1);
+            } 
+            // 5, 6: 連打ノーツ（始点＝枠線あり丸、胴体＝黄色帯、終点＝枠線なし丸）
+            else if (note.type === '5' || note.type === '6') {
+                if (elapsedTime >= note.time && elapsedTime <= note.endTime) activeRollNote = note;
+                const sHead = atlasSprites['note_' + note.type];
+                const sEnd = atlasSprites['note_' + note.type + '_end'];
+                const col = NOTE_COLORS_RGBA[note.type];
+
+                if (wSprite) spriteBatch.addThickLine(x, y, endX, endY, NOTE_SIZE[note.type] * 2, wu, wv, wu, wv, col[0], col[1], col[2], 1.0);
+                if (sEnd) spriteBatch.addQuad(endX - sEnd.center, endY - sEnd.center, sEnd.w, sEnd.h, sEnd.u0, sEnd.v0, sEnd.u1, sEnd.v1);
+                if (sHead) spriteBatch.addQuad(x - sHead.center, y - sHead.center, sHead.w, sHead.h, sHead.u0, sHead.v0, sHead.u1, sHead.v1);
+            } 
+            // 7: 風船ノーツ
+            else if (note.type === '7') {
+                let displayX = x, displayY = y;
+                if (note.judgeResult === 'pending') {
+                    if (elapsedTime <= note.endTime) {
+                        let stayAtHitPos = false;
+                        if (ppsX > 0) { if (x <= HIT_POSITION_X && endX > HIT_POSITION_X) stayAtHitPos = true; }
+                        else if (ppsX < 0) { if (x >= HIT_POSITION_X && endX < HIT_POSITION_X) stayAtHitPos = true; }
+                        else if (ppsY !== 0) { if (ppsY > 0) { if (y <= baseCenterY && endY > baseCenterY) stayAtHitPos = true; } else { if (y >= baseCenterY && endY < baseCenterY) stayAtHitPos = true; } }
+                        if (stayAtHitPos) {
+                            displayX = HIT_POSITION_X;
+                            displayY = (ppsX !== 0) ? y + (HIT_POSITION_X - x) * (ppsY / ppsX) : baseCenterY;
+                        }
+                        activeRollNote = note;
+                    } else { displayX = endX; displayY = endY; }
+                }
+                if (displayX > canvasWidth + canvasMargin || displayX < -canvasMargin || displayY > canvasHeight + canvasMargin || displayY < -canvasMargin) continue;
+
+                let angle = (ppsX !== 0 || ppsY !== 0) ? Math.atan2(ppsY, ppsX) : 0;
+                const sTail = atlasSprites['tail'];
+                if (sTail) spriteBatch.addRotatedQuad(displayX, displayY, sTail.w, sTail.h, angle, sTail.u0, sTail.v0, sTail.u1, sTail.v1, sTail.offsetX / sTail.w, sTail.offsetY / sTail.h);
+
+                const sHead = atlasSprites['note_7'];
+                if (sHead) spriteBatch.addQuad(displayX - sHead.center, displayY - sHead.center, sHead.w, sHead.h, sHead.u0, sHead.v0, sHead.u1, sHead.v1);
+
+                if (note.hits > 0 && note.judgeResult === 'pending') {
+                    const remStr = Math.max(0, note.hits - note.currentHits).toString();
+                    const charW = 10;
+                    const startX = displayX - (remStr.length * charW) / 2;
+                    for (let ci = 0; ci < remStr.length; ci++) {
+                        const ds = atlasSprites['digit_' + remStr[ci]];
+                        if (ds) spriteBatch.addQuad(startX + ci * charW, displayY - ds.h / 2, ds.w, ds.h, ds.u0, ds.v0, ds.u1, ds.v1);
+                    }
+                }
+            }
+        }
+    }
+
+    if (activeRollNote && activeRollNote.type !== '7') {
+        rollCountDisplay.textContent = activeRollNote.currentHits;
+        rollCountDisplay.style.opacity = 1;
+        rollCountDisplay.style.color = (activeRollNote.type === '6') ? NOTE_COLORS['6'] : NOTE_COLORS['5'];
+    } else {
+        rollCountDisplay.style.opacity = 0;
+    }
+    currentMeasureIndex = findMeasureIndex(elapsedTime);
+    updateMeasureDisplay();
+
+    if (showFpsSetting) {
+        previewFpsDisplay.textContent = `${renderFpsCurrent.toFixed(3)} FPS / ${renderMsCurrent.toFixed(3)} ms`;
+    } else {
+        previewFpsDisplay.textContent = '';
+    }
+
+    spriteBatch.end();
+}
+
 function drawLoop() {
-    if (!isPlaying) return; animationFrameId = requestAnimationFrame(drawLoop);
+    if (!isPlaying) return;
+    animationFrameId = requestAnimationFrame(drawLoop);
+
     const nowRender = performance.now();
     const deltaRender = nowRender - lastRenderTime;
     if (lastRenderTime > 0 && deltaRender > 0) {
@@ -1342,341 +1795,35 @@ function drawLoop() {
         renderFpsCurrent = 1000 / renderMsCurrent;
     }
     lastRenderTime = nowRender;
-    
+
     applyPendingHitEffects();
+
     if (isOriginalMode) {
         drawFHDLoop(currentElapsedTime);
     } else {
-        ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight); drawWaveform(currentElapsedTime);
-        const baseCenterY = canvas.clientHeight / 2; const canvasWidth = canvas.clientWidth, canvasHeight = canvas.clientHeight; const canvasMargin = 100; let activeRollNote = null;
-        const chart = currentChart; 
-        if (chart) {
-            let binConfig = chart._binConfig;
-            if (!chart.renderBins || !binConfig || binConfig.canvasWidth !== canvasWidth || binConfig.scrollMultiplier !== scrollMultiplier || binConfig.isFixedBpmEnabled !== isFixedBpmEnabled || binConfig.fixedBpmValue !== fixedBpmValue || binConfig.isWaveformEnabled !== isWaveformEnabled || binConfig.scrollYDirection !== scrollYDirection) {
-                rebuildRenderBins(chart, canvasWidth);
-            }
-
-            initCullBuffer(canvasWidth, canvasMargin);
-            const cullOffsetPx = canvasMargin * 4; 
-            const cullLimit = cullBufferObj.size;
-            const drawn1 = cullBufferObj.drawn1, drawn2 = cullBufferObj.drawn2, drawn3 = cullBufferObj.drawn3, drawn4 = cullBufferObj.drawn4, drawnBar = cullBufferObj.drawnBar, drawnGrid = cullBufferObj.drawnGrid;
-
-            const distNow = getDistanceAtTime(chart, currentElapsedTime);
-            const binIndex = Math.floor(currentElapsedTime / BIN_SIZE);
-            const bin = chart.renderBins.get(binIndex) || { regular: [], barlines: [] };
-            
-            const barlines = bin.barlines;
-            renderBuffer.barlinesCount = 0;
-            for (let i = 0; i < barlines.length; i++) {
-                const note = barlines[i];
-                if (note === chart.barlineArr[chart.barlineArr.length - 1]) continue;
-                const pos = calcNotePos(chart, note, currentElapsedTime, HIT_POSITION_X, baseCenterY, distNow);
-                if (pos.hidden || (pos.ppsX === 0 && pos.ppsY === 0)) continue;
-                if (pos.x < -canvasMargin || pos.x > canvasWidth + canvasMargin || pos.y < -canvasMargin || pos.y > canvasHeight + canvasMargin) continue;
-                
-                const px = Math.floor(pos.x * 4) + cullOffsetPx;
-                const py = Math.floor(pos.y * 4);
-                if (px >= 0 && px < cullLimit) { if (drawnBar[px] === py) continue; drawnBar[px] = py; }
-
-                if (renderBuffer.barlinesCount >= renderBuffer.barlines.length) { renderBuffer.barlines.push({ note: null, x: 0, y: 0, ppsX: 0, ppsY: 0 }); }
-                const item = renderBuffer.barlines[renderBuffer.barlinesCount++];
-                item.note = note; item.x = pos.x; item.y = pos.y; item.ppsX = pos.ppsX; item.ppsY = pos.ppsY;
-            }
-
-            for (let i = renderBuffer.barlinesCount - 1; i >= 0; i--) {
-                const item = renderBuffer.barlines[i];
-                const angle = Math.atan2(item.ppsY, item.ppsX), normalAngle = angle + Math.PI / 2; const dx = Math.cos(normalAngle) * (canvasHeight / 2), dy = Math.sin(normalAngle) * (canvasHeight / 2);
-                ctx.beginPath(); ctx.moveTo(item.x - dx, item.y - dy); ctx.lineTo(item.x + dx, item.y + dy); ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)'; ctx.lineWidth = 2; ctx.stroke();
-            }
-
-            const regular = bin.regular;
-            
-            if (showGridLines) {
-                renderBuffer.gridsCount = 0;
-                for (let i = 0; i < regular.length; i++) {
-                    const note = regular[i];
-                    const pos = calcNotePos(chart, note, currentElapsedTime, HIT_POSITION_X, baseCenterY, distNow);
-                    if (pos.hidden || pos.x < -canvasMargin || pos.x > canvasWidth + canvasMargin) continue;
-                    
-                    const px = Math.floor(pos.x * 4) + cullOffsetPx;
-                    const py = Math.floor(pos.y * 4);
-                    if (px >= 0 && px < cullLimit) { if (drawnGrid[px] === py) continue; drawnGrid[px] = py; }
-
-                    if (renderBuffer.gridsCount >= renderBuffer.grids.length) { renderBuffer.grids.push({ note: null, x: 0, y: 0 }); }
-                    const item = renderBuffer.grids[renderBuffer.gridsCount++];
-                    item.note = note; item.x = pos.x; item.y = pos.y;
-                }
-                for (let i = renderBuffer.gridsCount - 1; i >= 0; i--) {
-                    const item = renderBuffer.grids[i];
-                    ctx.beginPath(); ctx.moveTo(item.x, baseCenterY - 40); ctx.lineTo(item.x, baseCenterY + 40);
-                    if (item.note.lineIndex === highlightNoteLine && item.note.colIndex === highlightNoteCol) { ctx.strokeStyle = '#00BFFF'; ctx.lineWidth = 3; } else { ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)'; ctx.lineWidth = 1; }
-                    ctx.stroke();
-                }
-            }
-
-            renderBuffer.regularCount = 0;
-            for (let i = 0; i < regular.length; i++) {
-                const note = regular[i]; if (note.type === '0') continue;
-                if (chartCoolDownUntil !== null && note.time < chartCoolDownUntil) { if (note.type >= '5' && note.type <= '7' && note.endTime > currentElapsedTime) {  } else { continue; } }
-                
-                const pos = calcNotePos(chart, note, currentElapsedTime, HIT_POSITION_X, baseCenterY, distNow);
-                if (pos.hidden) continue;
-                const x = pos.x, y = pos.y, endX = pos.endX, endY = pos.endY, ppsX = pos.ppsX, ppsY = pos.ppsY;
-
-                let skip = false;
-                if (note.type >= '1' && note.type <= '4') {
-                    if (note.judgeResult === 'hit' || (x < -canvasMargin || x > canvasWidth + canvasMargin || y < -canvasMargin || y > canvasHeight + canvasMargin)) skip = true;
-                    if (!skip) {
-                        const px = Math.floor(x * 4) + cullOffsetPx;
-                        const py = Math.floor(y * 4);
-                        if (px >= 0 && px < cullLimit) {
-                            if (note.type === '1') { if (drawn1[px] === py) skip = true; else drawn1[px] = py; }
-                            else if (note.type === '2') { if (drawn2[px] === py) skip = true; else drawn2[px] = py; }
-                            else if (note.type === '3') { if (drawn3[px] === py) skip = true; else drawn3[px] = py; }
-                            else if (note.type === '4') { if (drawn4[px] === py) skip = true; else drawn4[px] = py; }
-                        }
-                    }
-                } else if (note.type === '5' || note.type === '6') {
-                    if ((x < -canvasMargin && endX < -canvasMargin) || (x > canvasWidth + canvasMargin && endX > canvasWidth + canvasMargin) || (y < -canvasMargin && endY < -canvasMargin) || (y > canvasHeight + canvasMargin && endY > canvasHeight + canvasMargin)) skip = true;
-                } else if (note.type === '7') {
-                    if (note.judgeResult === 'hit' || note.judgeResult === 'miss') skip = true;
-                }
-
-                if (skip) continue;
-                if (renderBuffer.regularCount >= renderBuffer.regular.length) { renderBuffer.regular.push({ note: null, x: 0, y: 0, endX: 0, endY: 0, ppsX: 0, ppsY: 0 }); }
-                const item = renderBuffer.regular[renderBuffer.regularCount++];
-                item.note = note; item.x = x; item.y = y; item.endX = endX; item.endY = endY; item.ppsX = ppsX; item.ppsY = ppsY;
-            }
-
-            if (!isPreRendered) initPreRenderedNotes();
-            const dpr = window.devicePixelRatio || 1;
-
-            for (let i = renderBuffer.regularCount - 1; i >= 0; i--) {
-                const item = renderBuffer.regular[i];
-                const { note, x, y, endX, endY, ppsX, ppsY } = item;
-                const pr = preRenderedNotes[note.type];
-
-                if (note.type >= '1' && note.type <= '4') {
-                    if(pr) ctx.drawImage(pr.canvas, x - pr.center, y - pr.center, pr.canvas.width / dpr, pr.canvas.height / dpr);
-                } else if (note.type === '5' || note.type === '6') {
-                    if (currentElapsedTime >= note.time && currentElapsedTime <= note.endTime) activeRollNote = note;
-                    const size = NOTE_SIZE[note.type], color = NOTE_COLORS[note.type];
-                    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(endX, endY); ctx.strokeStyle = color; ctx.lineWidth = size * 2; ctx.stroke();
-                    if(pr) {
-                        ctx.drawImage(pr.canvas, endX - pr.center, endY - pr.center, pr.canvas.width / dpr, pr.canvas.height / dpr);
-                        ctx.drawImage(pr.canvas, x - pr.center, y - pr.center, pr.canvas.width / dpr, pr.canvas.height / dpr);
-                    }
-                } else if (note.type === '7') {
-                    let displayX = x, displayY = y, stayAtHitPos = false;
-                    if (note.judgeResult === 'pending') {
-                        if (currentElapsedTime <= note.endTime) {
-                            if (ppsX > 0) { if (x <= HIT_POSITION_X && endX > HIT_POSITION_X) stayAtHitPos = true; }
-                            else if (ppsX < 0) { if (x >= HIT_POSITION_X && endX < HIT_POSITION_X) stayAtHitPos = true; }
-                            else if (ppsY !== 0) { if (ppsY > 0) { if (y <= baseCenterY && endY > baseCenterY) stayAtHitPos = true; } else { if (y >= baseCenterY && endY < baseCenterY) stayAtHitPos = true; } }
-                            if (stayAtHitPos) { displayX = HIT_POSITION_X; if (ppsX !== 0) displayY = y + (HIT_POSITION_X - x) * (ppsY / ppsX); else displayY = baseCenterY; }
-                            activeRollNote = note;
-                        } else { displayX = endX; displayY = endY; }
-                    }
-                    if (displayX > canvasWidth + canvasMargin || displayX < -canvasMargin || displayY > canvasHeight + canvasMargin || displayY < -canvasMargin) continue;
-                    
-                    let angle = 0; if (ppsX !== 0 || ppsY !== 0) angle = Math.atan2(ppsY, ppsX);
-                    
-                    const tail = preRenderedNotes['tail'];
-                    if (tail) {
-                        ctx.save(); ctx.translate(displayX, displayY); ctx.rotate(angle);
-                        ctx.drawImage(tail.canvas, -tail.offsetX, -tail.offsetY, tail.canvas.width / dpr, tail.canvas.height / dpr);
-                        ctx.restore();
-                    }
-                    
-                    if (pr) ctx.drawImage(pr.canvas, displayX - pr.center, displayY - pr.center, pr.canvas.width / dpr, pr.canvas.height / dpr);
-
-                    const remainingHits = Math.max(0, note.hits - note.currentHits);
-                    ctx.fillStyle = 'white'; ctx.font = 'bold 13px Inter'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-                    if (note.hits > 0 && note.judgeResult === 'pending') ctx.fillText(remainingHits.toString(), displayX, displayY);
-                }
-            }
-        }
-        
-        if (activeRollNote && activeRollNote.type !== '7') { rollCountDisplay.textContent = activeRollNote.currentHits; rollCountDisplay.style.opacity = 1; if (activeRollNote.type === '6') rollCountDisplay.style.color = NOTE_COLORS['6']; else rollCountDisplay.style.color = NOTE_COLORS['5']; } else { rollCountDisplay.style.opacity = 0; }
-        currentMeasureIndex = findMeasureIndex(currentElapsedTime); updateMeasureDisplay();
-
-        if (showFpsSetting) {
-            ctx.setTransform(window.devicePixelRatio || 1, 0, 0, window.devicePixelRatio || 1, 0, 0);
-            ctx.font = '10px monospace';
-            ctx.fillStyle = '#00FF00';
-            ctx.textAlign = 'left';
-            ctx.textBaseline = 'top';
-            ctx.fillText(`${renderFpsCurrent.toFixed(3)} FPS / ${renderMsCurrent.toFixed(3)} ms`, 5, 5);
-        }
-
-        renderWebGL(glPreview, glPreviewData, previewCanvas2D);
+        renderSpritePreview(currentElapsedTime);
     }
 }
 
 function updatePreview(time = currentElapsedTime) { 
     if (!currentChart) { 
-        if(!isOriginalMode) {
-            ctx.clearRect(0, 0, previewCanvas2D.width, previewCanvas2D.height);
-            renderWebGL(glPreview, glPreviewData, previewCanvas2D);
-        } else {
+        if(!isOriginalMode && glPreview) {
+            glPreview.clearColor(0, 0, 0, 0);
+            glPreview.clear(glPreview.COLOR_BUFFER_BIT);
+        } else if (isOriginalMode) {
             fctx.clearRect(0, 0, FHD_WIDTH, FHD_HEIGHT);
             renderWebGL(glFhd, glFhdData, fhdCanvas2D);
         }
         seekChartState(0); 
         return; 
     } 
-    resizeCanvas(); seekChartState(time); const elapsedTime = time, baseCenterY = canvas.clientHeight / 2; const canvasWidth = canvas.clientWidth, canvasHeight = canvas.clientHeight; const canvasMargin = 100; 
+    resizeCanvas();
+    seekChartState(time);
 
     if (isOriginalMode) {
         drawFHDLoop(time);
     } else {
-        ctx.clearRect(0, 0, canvasWidth, canvasHeight); drawWaveform(elapsedTime);
-
-        let binConfig = currentChart._binConfig;
-        if (!currentChart.renderBins || !binConfig || binConfig.canvasWidth !== canvasWidth || binConfig.scrollMultiplier !== scrollMultiplier || binConfig.isFixedBpmEnabled !== isFixedBpmEnabled || binConfig.fixedBpmValue !== fixedBpmValue || binConfig.isWaveformEnabled !== isWaveformEnabled || binConfig.scrollYDirection !== scrollYDirection) {
-            rebuildRenderBins(currentChart, canvasWidth);
-        }
-
-        initCullBuffer(canvasWidth, canvasMargin);
-        const cullOffsetPx = canvasMargin * 4; 
-        const cullLimit = cullBufferObj.size;
-        const drawn1 = cullBufferObj.drawn1, drawn2 = cullBufferObj.drawn2, drawn3 = cullBufferObj.drawn3, drawn4 = cullBufferObj.drawn4, drawnBar = cullBufferObj.drawnBar, drawnGrid = cullBufferObj.drawnGrid;
-
-        const distNow = getDistanceAtTime(currentChart, elapsedTime);
-        const binIndex = Math.floor(elapsedTime / BIN_SIZE);
-        const bin = currentChart.renderBins.get(binIndex) || { regular: [], barlines: [] };
-
-        const barlines = bin.barlines;
-        renderBuffer.barlinesCount = 0;
-        for (let i = 0; i < barlines.length; i++) {
-            const note = barlines[i];
-            if (note === currentChart.barlineArr[currentChart.barlineArr.length - 1]) continue;
-            const pos = calcNotePos(currentChart, note, elapsedTime, HIT_POSITION_X, baseCenterY, distNow);
-            if (pos.hidden || (pos.ppsX === 0 && pos.ppsY === 0)) continue;
-            if (pos.x < -canvasMargin || pos.x > canvasWidth + canvasMargin || pos.y < -canvasMargin || pos.y > canvasHeight + canvasMargin) continue;
-            
-            const px = Math.floor(pos.x * 4) + cullOffsetPx;
-            const py = Math.floor(pos.y * 4);
-            if (px >= 0 && px < cullLimit) { if (drawnBar[px] === py) continue; drawnBar[px] = py; }
-
-            if (renderBuffer.barlinesCount >= renderBuffer.barlines.length) { renderBuffer.barlines.push({ note: null, x: 0, y: 0, ppsX: 0, ppsY: 0 }); }
-            const item = renderBuffer.barlines[renderBuffer.barlinesCount++];
-            item.note = note; item.x = pos.x; item.y = pos.y; item.ppsX = pos.ppsX; item.ppsY = pos.ppsY;
-        }
-
-        for (let i = renderBuffer.barlinesCount - 1; i >= 0; i--) {
-            const item = renderBuffer.barlines[i];
-            const angle = Math.atan2(item.ppsY, item.ppsX), normalAngle = angle + Math.PI / 2; const dx = Math.cos(normalAngle) * (canvasHeight / 2), dy = Math.sin(normalAngle) * (canvasHeight / 2);
-            ctx.beginPath(); ctx.moveTo(item.x - dx, item.y - dy); ctx.lineTo(item.x + dx, item.y + dy); ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)'; ctx.lineWidth = 2; ctx.stroke();
-        }
-
-        const regular = bin.regular;
-
-        if (showGridLines) {
-            renderBuffer.gridsCount = 0;
-            for (let i = 0; i < regular.length; i++) {
-                const note = regular[i];
-                const pos = calcNotePos(currentChart, note, elapsedTime, HIT_POSITION_X, baseCenterY, distNow);
-                if (pos.hidden || pos.x < -canvasMargin || pos.x > canvasWidth + canvasMargin) continue;
-                
-                const px = Math.floor(pos.x * 4) + cullOffsetPx;
-                const py = Math.floor(pos.y * 4);
-                if (px >= 0 && px < cullLimit) { if (drawnGrid[px] === py) continue; drawnGrid[px] = py; }
-
-                if (renderBuffer.gridsCount >= renderBuffer.grids.length) { renderBuffer.grids.push({ note: null, x: 0, y: 0 }); }
-                const item = renderBuffer.grids[renderBuffer.gridsCount++];
-                item.note = note; item.x = pos.x; item.y = pos.y;
-            }
-            for (let i = renderBuffer.gridsCount - 1; i >= 0; i--) {
-                const item = renderBuffer.grids[i];
-                ctx.beginPath(); ctx.moveTo(item.x, baseCenterY - 40); ctx.lineTo(item.x, baseCenterY + 40);
-                if (item.note.lineIndex === highlightNoteLine && item.note.colIndex === highlightNoteCol) { ctx.strokeStyle = '#00BFFF'; ctx.lineWidth = 3; } else { ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)'; ctx.lineWidth = 1; }
-                ctx.stroke();
-            }
-        }
-
-        renderBuffer.regularCount = 0;
-        for (let i = 0; i < regular.length; i++) {
-            const note = regular[i]; if (note.type === '0') continue;
-            const pos = calcNotePos(currentChart, note, elapsedTime, HIT_POSITION_X, baseCenterY, distNow);
-            if (pos.hidden) continue;
-            const x = pos.x, y = pos.y, endX = pos.endX, endY = pos.endY, ppsX = pos.ppsX, ppsY = pos.ppsY;
-            
-            let skip = false;
-            if (note.type < '5' || (note.type === '7' && (note.judgeResult === 'hit' || note.judgeResult === 'miss'))) { if (x < -canvasMargin || x > canvasWidth + canvasMargin || y < -canvasMargin || y > canvasHeight + canvasMargin) skip = true; } 
-            if (!skip && (note.type === '5' || note.type === '6' || (note.type === '7' && note.judgeResult === 'pending'))) { if ((x < -canvasMargin && endX < -canvasMargin) || (x > canvasWidth + canvasMargin && endX > canvasWidth + canvasMargin) || (y < -canvasMargin && endY < -canvasMargin) || (y > canvasHeight + canvasMargin && endY > canvasHeight + canvasMargin)) skip = true; } 
-            if (!skip && note.judgeResult === 'hit' && (note.type >= '1' && note.type <= '4')) { skip = true; } 
-            
-            if (!skip && note.type >= '1' && note.type <= '4') {
-                const px = Math.floor(x * 4) + cullOffsetPx;
-                const py = Math.floor(y * 4);
-                if (px >= 0 && px < cullLimit) {
-                    if (note.type === '1') { if (drawn1[px] === py) skip = true; else drawn1[px] = py; }
-                    else if (note.type === '2') { if (drawn2[px] === py) skip = true; else drawn2[px] = py; }
-                    else if (note.type === '3') { if (drawn3[px] === py) skip = true; else drawn3[px] = py; }
-                    else if (note.type === '4') { if (drawn4[px] === py) skip = true; else drawn4[px] = py; }
-                }
-            }
-
-            if (skip) continue;
-            if (renderBuffer.regularCount >= renderBuffer.regular.length) { renderBuffer.regular.push({ note: null, x: 0, y: 0, endX: 0, endY: 0, ppsX: 0, ppsY: 0 }); }
-            const item = renderBuffer.regular[renderBuffer.regularCount++];
-            item.note = note; item.x = x; item.y = y; item.endX = endX; item.endY = endY; item.ppsX = ppsX; item.ppsY = ppsY;
-        }
-
-        if (!isPreRendered) initPreRenderedNotes();
-        const dpr = window.devicePixelRatio || 1;
-
-        for (let i = renderBuffer.regularCount - 1; i >= 0; i--) {
-            const item = renderBuffer.regular[i];
-            const { note, x, y, endX, endY, ppsX, ppsY } = item;
-            const pr = preRenderedNotes[note.type];
-
-            if (note.type === '7') { 
-                let displayX = x, displayY = y, stayAtHitPos = false; 
-                if (note.judgeResult === 'pending') { 
-                    if (elapsedTime <= note.endTime) { 
-                        if (ppsX > 0) { if (x <= HIT_POSITION_X && endX > HIT_POSITION_X) stayAtHitPos = true; } 
-                        else if (ppsX < 0) { if (x >= HIT_POSITION_X && endX < HIT_POSITION_X) stayAtHitPos = true; } 
-                        else if (ppsY !== 0) { if (ppsY > 0) { if (y <= baseCenterY && endY > baseCenterY) stayAtHitPos = true; } else { if (y >= baseCenterY && endY < baseCenterY) stayAtHitPos = true; } } 
-                        if (stayAtHitPos) { displayX = HIT_POSITION_X; if (ppsX !== 0) displayY = y + (HIT_POSITION_X - x) * (ppsY / ppsX); else displayY = baseCenterY; } 
-                    } else { displayX = endX; displayY = endY; } 
-                } 
-                if (displayX > canvasWidth + canvasMargin || displayX < -canvasMargin || displayY > canvasHeight + canvasMargin || displayY < -canvasMargin) continue; 
-                
-                let angle = 0; if (ppsX !== 0 || ppsY !== 0) angle = Math.atan2(ppsY, ppsX);
-                
-                const tail = preRenderedNotes['tail'];
-                if (tail) {
-                    ctx.save(); ctx.translate(displayX, displayY); ctx.rotate(angle);
-                    ctx.drawImage(tail.canvas, -tail.offsetX, -tail.offsetY, tail.canvas.width / dpr, tail.canvas.height / dpr);
-                    ctx.restore();
-                }
-
-                if (pr) ctx.drawImage(pr.canvas, displayX - pr.center, displayY - pr.center, pr.canvas.width / dpr, pr.canvas.height / dpr);
-                ctx.fillStyle = 'white'; ctx.font = 'bold 13px Inter'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; if (note.hits > 0) ctx.fillText(note.hits.toString(), displayX, displayY); 
-            } else if (note.type === '5' || note.type === '6') { 
-                const size = NOTE_SIZE[note.type], color = NOTE_COLORS[note.type];
-                ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(endX, endY); ctx.strokeStyle = color; ctx.lineWidth = size * 2; ctx.stroke(); 
-                if (pr) {
-                    ctx.drawImage(pr.canvas, endX - pr.center, endY - pr.center, pr.canvas.width / dpr, pr.canvas.height / dpr);
-                    ctx.drawImage(pr.canvas, x - pr.center, y - pr.center, pr.canvas.width / dpr, pr.canvas.height / dpr);
-                }
-            } else { 
-                if (pr) ctx.drawImage(pr.canvas, x - pr.center, y - pr.center, pr.canvas.width / dpr, pr.canvas.height / dpr);
-            } 
-        } 
-        
-        if (showFpsSetting) {
-            ctx.setTransform(window.devicePixelRatio || 1, 0, 0, window.devicePixelRatio || 1, 0, 0);
-            ctx.font = '10px monospace';
-            ctx.fillStyle = '#00FF00';
-            ctx.textAlign = 'left';
-            ctx.textBaseline = 'top';
-            ctx.fillText(`${renderFpsCurrent.toFixed(3)} FPS / ${renderMsCurrent.toFixed(3)} ms`, 5, 5);
-        }
-
-        renderWebGL(glPreview, glPreviewData, previewCanvas2D);
+        renderSpritePreview(time);
     }
 }</script>
 
@@ -2026,7 +2173,8 @@ function stopSimulation() {
     playButton.textContent = '再生'; playButton.className = "px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white font-semibold rounded-lg shadow transition-colors duration-200";
     playButton.disabled = false;
     editor.disabled = false; judgeDisplay.innerHTML = ''; rollCountDisplay.style.opacity = 0; pendingHitEffects.clear(); activeFhdJudges = []; activeFhdHitEffects = {}; updatePreview(currentElapsedTime); 
-}</script>
+}
+</script>
     <script>function findMeasureIndex(time) { 
     if (!currentChart || !currentChart.allMeasureTimes || currentChart.allMeasureTimes.length === 0) return 0; 
     const times = currentChart.allMeasureTimes; 
@@ -2043,14 +2191,54 @@ function seekToMeasure(direction) {
 }
 function playMeasure() { 
     if (isPreparing) return;
+    initializeAudio();
+    if (audioContext && audioContext.state === 'suspended') audioContext.resume().catch(() => {});
     if (!isLivePreviewEnabled && !isPlaying) applyEditorChange();
-    if (isPlaying) { stopSimulation(); if (currentChart) { const newMeasureIndex = findMeasureIndex(currentElapsedTime); setChartTime(currentChart.allMeasureTimes[newMeasureIndex], newMeasureIndex); } } else { const newMeasureIndex = findMeasureIndex(currentElapsedTime); const targetTime = currentChart.allMeasureTimes[newMeasureIndex]; setChartTime(targetTime, newMeasureIndex); currentElapsedTime = Math.max(0, targetTime - coolDownTime); chartCoolDownUntil = targetTime; seekChartState(currentElapsedTime); stopAtTime = null; startSimulation(); } 
+    if (isPlaying) { 
+        stopSimulation(); 
+        if (currentChart) { 
+            const newMeasureIndex = findMeasureIndex(currentElapsedTime); 
+            setChartTime(currentChart.allMeasureTimes[newMeasureIndex], newMeasureIndex); 
+        } 
+    } else { 
+        const newMeasureIndex = findMeasureIndex(currentElapsedTime); 
+        const targetTime = currentChart.allMeasureTimes[newMeasureIndex]; 
+        setChartTime(targetTime, newMeasureIndex); 
+        currentElapsedTime = Math.max(0, targetTime - coolDownTime); 
+        chartCoolDownUntil = targetTime; 
+        seekChartState(currentElapsedTime); 
+        stopAtTime = null; 
+        startSimulation(); 
+    } 
 }
+
 function togglePlay() { 
     if (isPreparing) return;
+    initializeAudio();
+    if (audioContext && audioContext.state === 'suspended') audioContext.resume().catch(() => {});
     editor.blur(); previewContainer.focus(); fhdCanvas.focus();
     if (!isLivePreviewEnabled && !isPlaying) applyEditorChange();
-    if (isPlaying) { stopSimulation(); if (currentChart) { const newMeasureIndex = findMeasureIndex(currentElapsedTime); setChartTime(currentChart.allMeasureTimes[newMeasureIndex], newMeasureIndex); } } else { const targetTime = currentElapsedTime; const mIdx = findMeasureIndex(targetTime); setChartTime(targetTime, mIdx); if (targetTime === 0) { chartCoolDownUntil = coolDownTime; currentElapsedTime = 0; } else { currentElapsedTime = Math.max(0, targetTime - coolDownTime); chartCoolDownUntil = targetTime; } seekChartState(currentElapsedTime); stopAtTime = null; startSimulation(); } 
+    if (isPlaying) { 
+        stopSimulation(); 
+        if (currentChart) { 
+            const newMeasureIndex = findMeasureIndex(currentElapsedTime); 
+            setChartTime(currentChart.allMeasureTimes[newMeasureIndex], newMeasureIndex); 
+        } 
+    } else { 
+        const targetTime = currentElapsedTime; 
+        const mIdx = findMeasureIndex(targetTime); 
+        setChartTime(targetTime, mIdx); 
+        if (targetTime === 0) { 
+            chartCoolDownUntil = coolDownTime; 
+            currentElapsedTime = 0; 
+        } else { 
+            currentElapsedTime = Math.max(0, targetTime - coolDownTime); 
+            chartCoolDownUntil = targetTime; 
+        } 
+        seekChartState(currentElapsedTime); 
+        stopAtTime = null; 
+        startSimulation(); 
+    } 
 }
 function updateAutoDisplay() { autoStatus.style.display = isAutoPlay ? 'block' : 'none'; }
 function toggleAutoPlay() { isAutoPlay = !isAutoPlay; updateAutoDisplay(); }
@@ -2165,13 +2353,15 @@ function handlePlayerInput(inputType, hitEffectType) {
         const settingsButton = document.getElementById('settingsButton');
         const autoStatus = document.getElementById('autoStatus');
         const uiMain = document.getElementById('ui-main');
+        const previewFpsDisplay = document.getElementById('previewFpsDisplay');
 
         // WebGL対応 Canvas初期化
         const canvas = document.getElementById('previewCanvas');
-        const glPreview = canvas.getContext('webgl', { alpha: true, premultipliedAlpha: false });
-        const glPreviewData = initWebGL(glPreview);
-        const previewCanvas2D = document.createElement('canvas');
-        const ctx = previewCanvas2D.getContext('2d');
+        const glPreview = canvas.getContext('webgl', { alpha: true, premultipliedAlpha: true });
+        let spriteBatch = null;
+        if (glPreview) {
+            spriteBatch = new WebGLSpriteBatch(glPreview);
+        }
 
         const fhdCanvas = document.getElementById('fhdCanvas');
         const glFhd = fhdCanvas.getContext('webgl', { alpha: false });
@@ -2181,16 +2371,8 @@ function handlePlayerInput(inputType, hitEffectType) {
         fhdCanvas2D.height = FHD_HEIGHT;
         const fctx = fhdCanvas2D.getContext('2d');
 
-        const renderBuffer = {
-            barlines: Array.from({ length: 500 }, () => ({ note: null, x: 0, y: 0, ppsX: 0, ppsY: 0 })),
-            barlinesCount: 0,
-            grids: Array.from({ length: 2000 }, () => ({ note: null, x: 0, y: 0 })),
-            gridsCount: 0,
-            regular: Array.from({ length: 2000 }, () => ({ note: null, x: 0, y: 0, endX: 0, endY: 0, ppsX: 0, ppsY: 0 })),
-            regularCount: 0
-        };
-
-        const cullBufferObj = { size: 0, drawn1: null, drawn2: null, drawn3: null, drawn4: null, drawnBar: null, drawnGrid: null };
+        // 4倍解像度カリング用バッファ
+        const cullBufferObj = { size: 0, frameId: 0, drawn1: null, drawn2: null, drawn3: null, drawn4: null, drawnBar: null, drawnGrid: null };
 
         function initCullBuffer(canvasWidth, margin) {
             const requiredSize = (canvasWidth + margin * 2 + 100) * 4; 
@@ -2202,10 +2384,13 @@ function handlePlayerInput(inputType, hitEffectType) {
                 cullBufferObj.drawn4 = new Int32Array(requiredSize);
                 cullBufferObj.drawnBar = new Int32Array(requiredSize);
                 cullBufferObj.drawnGrid = new Int32Array(requiredSize);
-                
-                cullBufferObj.drawn1.fill(-999999); cullBufferObj.drawn2.fill(-999999); cullBufferObj.drawn3.fill(-999999); cullBufferObj.drawn4.fill(-999999); cullBufferObj.drawnBar.fill(-999999); cullBufferObj.drawnGrid.fill(-999999);
+                cullBufferObj.frameId = 1;
             } else {
-                cullBufferObj.drawn1.fill(-999999); cullBufferObj.drawn2.fill(-999999); cullBufferObj.drawn3.fill(-999999); cullBufferObj.drawn4.fill(-999999); cullBufferObj.drawnBar.fill(-999999); cullBufferObj.drawnGrid.fill(-999999);
+                cullBufferObj.frameId = (cullBufferObj.frameId + 1) & 0x7FFF;
+                if (cullBufferObj.frameId === 0) {
+                    cullBufferObj.drawn1.fill(0); cullBufferObj.drawn2.fill(0); cullBufferObj.drawn3.fill(0); cullBufferObj.drawn4.fill(0); cullBufferObj.drawnBar.fill(0); cullBufferObj.drawnGrid.fill(0);
+                    cullBufferObj.frameId = 1;
+                }
             }
         }</script>
     <script>        function updateCursorPosition() {
@@ -2627,4 +2812,4 @@ initialLoad();
 
 </script>
 </body>
-</html>
+    </html>
